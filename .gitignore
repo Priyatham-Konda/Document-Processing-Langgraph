@@ -1,0 +1,15 @@
+venv/
+env/
+document_images/
+review_data/
+extraction_logs/
+learning_data/
+raw_documents/
+__pycache__
+.env
+templates/
+raw_documents/
+prompts/
+temp_uploads/
+frontend/document-processing-frontend/node_modules/
+frontend/document-processing-frontend/package-lock.json
