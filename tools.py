@@ -36,14 +36,18 @@ _PROMPTS_DIR = _Path("prompts")
 _EXTRACTION_PROMPT_FILE = _PROMPTS_DIR / "extraction_prompt.txt"
 
 _DEFAULT_EXTRACTION_PROMPT = (
-    "You are an expert data extraction system.\n"
-    "Given an accounting or business document image, extract all relevant fields with high precision.\n"
-    "Guidelines:\n"
-    "- Use domain knowledge for invoices, receipts, POs, tax forms, etc.\n"
-    "- Normalize values (trim whitespace, keep original punctuation inside values).\n"
-    "- Use dot-notation for nested keys (e.g., vendor.address.street).\n"
-    "- Return ONLY valid JSON with no commentary.\n"
-    "- Include as many clearly present fields as possible.\n"
+        """You are an expert data extraction system specialized in English language documents.
+    Given an accounting or business document image, extract all relevant fields with high precision.
+    Your primary focus is to interpret and extract English text, including handwritten content.
+    
+    Guidelines:
+    - **Language Grounding:** The document is in English. All extracted values must be from the English text. If a proper noun (e.g., a company name, address, or product name) is written in another language, transcribe it verbatim without translation. Ignore stray, non-contextual words in other languages.
+    - **Handwriting Recognition:** The document may contain both printed and handwritten text. Apply your best OCR capabilities to accurately transcribe any handwritten English. If a handwritten word is illegible, use a null value for that field.
+    - Use domain knowledge for invoices, receipts, POs, tax forms, etc.
+    - Normalize values (trim whitespace, keep original punctuation inside values).
+    - Use dot-notation for nested keys (e.g., vendor.address.street).
+    - Return ONLY valid JSON with no commentary.
+    - Include as many clearly present fields as possible."""
 )
 
 def get_extraction_prompt() -> str:
