@@ -19,6 +19,8 @@ import time
 from doc_process_gemini_v2 import build_graph, apply_human_corrections
 from doc_process_gemini_v2 import application_agent
 from doc_process_gemini_v2 import learning_agent
+from redis_state import set_job_status, set_job_state, get_job_state, update_job_state
+from tasks import process_document_task
 
 
 
@@ -45,8 +47,7 @@ UPLOAD_FOLDER = "temp_uploads"
 for folder in [UPLOAD_FOLDER, "review_data", "document_images", "extraction_logs", "learning_data", "raw documents"]:
     os.makedirs(folder, exist_ok=True)
 
-# In-memory reviewer sessions (document_id -> state snapshot)
-REVIEW_SESSIONS: Dict[str, Any] = {}
+# Removed in-memory review sessions; state is persisted in Redis per document_id
 
 # Supported file types
 ALLOWED_EXTENSIONS = {
@@ -77,6 +78,31 @@ class ReviewStatus(BaseModel):
     document_id: str
     status: str
     segments: List[Dict[str, Any]]
+
+# Utility: JSON-safe serialization for workflow results
+def _to_jsonable(obj):
+    from dataclasses import is_dataclass, asdict
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if is_dataclass(obj):
+        return _to_jsonable(asdict(obj))
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+    # Datetime-like
+    if hasattr(obj, "isoformat"):
+        try:
+            return obj.isoformat()
+        except Exception:
+            pass
+    try:
+        import json as _json
+        return _json.loads(_json.dumps(obj))
+    except Exception:
+        return str(obj)
 
 def allowed_file(filename: str) -> bool:
     """Check if file extension is allowed."""
@@ -916,9 +942,13 @@ async def process_documents(files: List[UploadFile] = File(...)):
                     }
                     
                     enriched_metadata = final_results.get('metadata') or {"filename": file.filename}
-                    # Store for approval phase
+                    # Persist results in Redis for approval phase
                     if final_results.get('document_id'):
-                        REVIEW_SESSIONS[final_results.get('document_id')] = final_results
+                        update_job_state(final_results.get('document_id'), {
+                            'status': 'completed',
+                            'results': _to_jsonable(final_results),
+                            'completed_at': datetime.now().isoformat(),
+                        })
                     results.append(FileProcessingResult(
                         filename=file.filename,
                         status="success",
@@ -955,24 +985,8 @@ async def process_documents(files: List[UploadFile] = File(...)):
     )
 
 def _run_workflow_background(file_bytes: bytes, filename: str, document_id: str):
-    """Background worker to run the LangGraph workflow and stash results for later approval."""
-    try:
-        workflow_app = build_graph()
-        initial_state = {
-            "file_bytes": file_bytes,
-            "metadata": {"filename": filename},
-            "document_id": document_id,
-        }
-        final_state = None
-        for event in workflow_app.stream(initial_state):
-            final_state = event
-        if final_state:
-            last_node = list(final_state.keys())[0]
-            final_results = final_state[last_node] or {}
-            if final_results.get('document_id'):
-                REVIEW_SESSIONS[final_results.get('document_id')] = final_results
-    except Exception as e:
-        print(f"[background] Workflow failed for {filename} ({document_id}): {e}")
+    # Deprecated: background tasks replaced by Celery. Retained as no-op for backward compatibility.
+    pass
 
 @app.post("/process-init")
 async def process_init(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
@@ -1034,9 +1048,11 @@ async def process_init(background_tasks: BackgroundTasks, files: List[UploadFile
         except Exception as e:
             print(f"[background] Warning: could not persist raw document for {document_id}: {e}")
 
-        # Kick off background processing
-        background_tasks.add_task(_run_workflow_background, processed_bytes, file.filename, document_id)
-        print(f"[process-init] Background task scheduled for {document_id}")
+        # Initialize job in Redis and enqueue Celery task
+        set_job_status(document_id, "queued", {"filename": file.filename, "created_at": datetime.now().isoformat()})
+        # Celery requires bytes; ensure processed_bytes is bytes already
+        process_document_task.delay(document_id=document_id, file_bytes=processed_bytes, filename=file.filename)
+        print(f"[process-init] Celery task enqueued for {document_id}")
 
         results.append({
             "filename": file.filename,
@@ -1085,10 +1101,20 @@ async def review_submit(payload: ReviewSubmitRequest):
     out_dir = Path(f"learning_data/{document_id}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Retrieve authoritative state awaiting approval
-    state_snapshot = REVIEW_SESSIONS.get(document_id)
-    if not state_snapshot:
-        raise HTTPException(status_code=404, detail="No pending review session for this document")
+    # Retrieve authoritative state from Redis, waiting until results are ready
+    # Block until results are present (polling), so clients don't need a separate /job-status call
+    start_ts = time.time()
+    max_wait_s = float(os.getenv("REVIEW_SUBMIT_MAX_WAIT_SEC", "180"))
+    poll_s = max(0.05, float(os.getenv("REVIEW_SUBMIT_POLL_SEC", "0.5")))
+    job_state = None
+    while True:
+        job_state = get_job_state(document_id)
+        if job_state and job_state.get("results"):
+            break
+        if max_wait_s > 0 and (time.time() - start_ts) >= max_wait_s:
+            raise HTTPException(status_code=404, detail="No results found for this document (timeout waiting for processing)")
+        await asyncio.sleep(poll_s)
+    state_snapshot = job_state.get("results")
 
     # Build index of current extracted fields: name -> entry
     extraction_results = state_snapshot.get("extraction_results") or []
@@ -1164,7 +1190,7 @@ async def review_submit(payload: ReviewSubmitRequest):
     try:
         app_result = application_agent(state_snapshot)
         state_snapshot.update(app_result)
-        REVIEW_SESSIONS[document_id] = state_snapshot
+        update_job_state(document_id, {"results": state_snapshot, "application_ran_at": datetime.now().isoformat()})
         try:
             print(f"[review-submit] Triggering learning_agent; total_changes={total_changes}")
             learning_agent(state_snapshot)
@@ -1190,6 +1216,13 @@ async def review_submit(payload: ReviewSubmitRequest):
         "total_changes": total_changes,
         "application_results": application_results,
     }
+
+@app.get("/job-status/{document_id}")
+async def job_status(document_id: str):
+    state = get_job_state(document_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return state
 
 # Disabled approve-submit endpoint (kept for future use)
 # @app.post("/approve-submit")
@@ -1223,7 +1256,7 @@ async def get_review_data(document_id: str):
     }
 
 @app.get("/extraction-structured/{document_id}")
-async def get_extraction_structured(document_id: str, poll_ms: int = 500, settle_ms: int = 800):
+async def get_extraction_structured(document_id: str, poll_ms: int = 500, settle_ms: int = 800, max_wait_ms: int = 0):
     """Aggregate structured extraction JSON per segment for a document.
     Reads files created by extractor in `document_images/{document_id}/structured_outputs`.
 
@@ -1231,14 +1264,20 @@ async def get_extraction_structured(document_id: str, poll_ms: int = 500, settle
     given document_id, then returns the aggregated data. It will continue waiting
     (with polling) until files appear, so callers should await this endpoint.
     """
+    print(f"[extraction-structured] document_id={document_id}, poll_ms={poll_ms}, settle_ms={settle_ms}, max_wait_ms={max_wait_ms}")
     base_dir = Path(f"document_images/{document_id}/structured_outputs")
     images_dir = Path(f"document_images/{document_id}")
 
     # Adaptive wait: wait until no new structured files appear for settle_ms
     last_count = -1
     last_change_ts = time.time()
+    start_ts = time.time()
     settle_s = max(0.05, settle_ms / 1000)
     while True:
+        # If max_wait_ms <= 0, wait indefinitely; otherwise honor the cap
+        if max_wait_ms and (time.time() - start_ts) * 1000 >= max_wait_ms:
+            print(f"[extraction-structured] timeout waiting for files for {document_id}")
+            break
         expected_segments = 0
         try:
             if images_dir.exists():
@@ -1575,4 +1614,4 @@ if __name__ == "__main__":
     print("📈 System stats: http://localhost:8000/stats")
     print("❤️ Health check: http://localhost:8000/health")
     
-    uvicorn.run(app, host="0.0.0.0", port=8001, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

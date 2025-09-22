@@ -874,8 +874,9 @@ def application_agent(state: GraphState) -> Dict[str, Any]:
         
         # Return failure for all segments
         for extraction in state["extraction_results"]:
+            seg_id = extraction.get("segment_id") if isinstance(extraction, dict) else getattr(extraction, "segment_id", None)
             application_results.append(ApplicationResult(
-                segment_id=extraction.segment_id,
+                segment_id=seg_id or "unknown_segment",
                 success=False,
                 error_message=error_msg
             ))
@@ -888,9 +889,14 @@ def application_agent(state: GraphState) -> Dict[str, Any]:
             "final_decision": "rejected"
         }
     
-    # Process each extraction result
+    # Process each extraction result (support dataclass objects and plain dicts)
     for extraction in state["extraction_results"]:
-        segment_id = extraction.segment_id
+        if isinstance(extraction, dict):
+            segment_id = extraction.get("segment_id")
+            extraction_fields = extraction.get("fields") or []
+        else:
+            segment_id = getattr(extraction, "segment_id", None)
+            extraction_fields = getattr(extraction, "fields", [])
         print(f"  Processing segment {segment_id} for Product2 integration...")
         
         try:
@@ -903,7 +909,17 @@ def application_agent(state: GraphState) -> Dict[str, Any]:
                     except Exception:
                         return str(v)
                 return v
-            fields_dict = {field.name: _normalize(field.value) for field in extraction.fields}
+            fields_dict: Dict[str, Any] = {}
+            for f in extraction_fields:
+                if isinstance(f, dict):
+                    name = f.get("name")
+                    value = f.get("value")
+                else:
+                    name = getattr(f, "name", None)
+                    value = getattr(f, "value", None)
+                if name is None:
+                    continue
+                fields_dict[name] = _normalize(value)
             
             # Process document to Product2
             result = process_document_to_salesforce(

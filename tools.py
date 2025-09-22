@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 import sys
 from pathlib import Path as _Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from celery.result import AsyncResult
 
 # Load environment variables
 load_dotenv()
@@ -36,10 +37,10 @@ _PROMPTS_DIR = _Path("prompts")
 _EXTRACTION_PROMPT_FILE = _PROMPTS_DIR / "extraction_prompt.txt"
 
 _DEFAULT_EXTRACTION_PROMPT = (
-        """You are an expert data extraction system specialized in English language documents.
+    """You are an expert data extraction system specialized in English language documents.
     Given an accounting or business document image, extract all relevant fields with high precision.
     Your primary focus is to interpret and extract English text, including handwritten content.
-    
+
     Guidelines:
     - **Language Grounding:** The document is in English. All extracted values must be from the English text. If a proper noun (e.g., a company name, address, or product name) is written in another language, transcribe it verbatim without translation. Ignore stray, non-contextual words in other languages.
     - **Handwriting Recognition:** The document may contain both printed and handwritten text. Apply your best OCR capabilities to accurately transcribe any handwritten English. If a handwritten word is illegible, use a null value for that field.
@@ -256,58 +257,30 @@ def ask_gemini_about_image(image_path: str, prompt: str, model: str = "gemini-2.
 
 
 def ask_gemini_text_only(prompt: str, model: str = "gemini-2.5-pro") -> str:
-    """Generic function to send text-only prompt to Gemini API (no image).
-    
-    Args:
-        prompt: The text prompt/question
-        model: Gemini model to use (default: gemini-2.5-pro)
-        
-    Returns:
-        The text response from Gemini API
+    """Enqueue Gemini text-only call as a Celery task and block on the worker result.
+
+    For API endpoints, prefer enqueuing and returning the Celery task id instead of blocking.
     """
     try:
-        print(f"    [DEBUG] Starting Gemini text-only API call...")
-        print(f"    [DEBUG] API Key present: {bool(os.environ.get('GEMINI_API_KEY'))}")
-        print(f"    [DEBUG] Model: {model}")
-        
-        def _create_client():
-            return genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        client = _create_client()
-        print(f"    [DEBUG] Client created successfully")
+        print(f"    [DEBUG] Enqueuing Gemini text-only task...")
+        # Lazy import to avoid circular dependency during module import
+        from tasks import ask_gemini_text_only_task  # type: ignore
+        async_result: AsyncResult = ask_gemini_text_only_task.delay(prompt=prompt, model=model)
 
-        # Add the prompt as text only
-        parts = [types.Part.from_text(text=prompt)]
-        print(f"    [DEBUG] Prompt added to request (length: {len(prompt)})")
-
-        contents = [types.Content(role="user", parts=parts)]
-        print(f"    [DEBUG] Content prepared with {len(parts)} parts")
-
-        generate_content_config = types.GenerateContentConfig(
-            response_modalities=["TEXT"],  # we only want text back
-        )
-        print(f"    [DEBUG] Config prepared")
-
-        print(f"    [DEBUG] Calling Gemini API...")
-
-        timeout_seconds = int(os.environ.get("GEMINI_TEXT_TIMEOUT_SEC", "30"))
-
-        def _do_call():
-            return client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=generate_content_config,
-            )
-
-        response = _run_with_timeout(_do_call, timeout_seconds)
-        print(f"    [DEBUG] API call completed")
-
-        result_text = response.candidates[0].content.parts[0].text
-        print(f"    [DEBUG] Response text length: {len(result_text) if result_text else 0}")
-        return result_text
-
+        # Optional: blocking wait for internal callers with a generous timeout separate from web timeouts
+        timeout_seconds = int(os.environ.get("GEMINI_TEXT_TIMEOUT_SEC", "300"))
+        result = async_result.get(timeout=timeout_seconds, propagate=True)
+        print(f"    [DEBUG] Task completed; result length: {len(result) if result else 0}")
+        return result
     except Exception as e:
-        print(f"    [DEBUG] Error calling Gemini API: {str(e)}")
-        print(f"    [DEBUG] Error type: {type(e).__name__}")
+        print(f"    [DEBUG] Error awaiting Gemini Celery task: {str(e)}")
         import traceback
         print(f"    [DEBUG] Traceback: {traceback.format_exc()}")
         return f"Error: {str(e)}"
+
+
+def enqueue_gemini_text_only(prompt: str, model: str = "gemini-2.5-pro") -> str:
+    """Submit the task and return Celery task id for polling elsewhere."""
+    from tasks import ask_gemini_text_only_task  # type: ignore
+    async_result: AsyncResult = ask_gemini_text_only_task.delay(prompt=prompt, model=model)
+    return async_result.id
